@@ -1,16 +1,12 @@
-use std::collections::VecDeque;
 use std::thread::{self, JoinHandle};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc::{self, Sender, Receiver}};
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
 
 pub struct ThreadPool {
     size: usize,
-    threads: Vec<Worker>,
-    queue: Arc<Mutex<VecDeque<Box<dyn FnOnce() + Send + 'static>>>>,
-}
-
-struct Worker { 
-    id: usize,
-    thread: JoinHandle<()>,
+    workers: Vec<Worker>,
+    sender: Option<Sender<Job>>,
 }
 
 impl ThreadPool {
@@ -21,38 +17,62 @@ impl ThreadPool {
     pub fn new(size: usize) -> ThreadPool {
         assert!(size > 0);
         
-        let mut threads = Vec::with_capacity(size);
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut workers = Vec::with_capacity(size);
+        let (sender, receiver) = mpsc::channel();
+        let receiver = Arc::new(Mutex::new(receiver));
 
         for worker_id in 0..size {
-            threads.push(Worker::new(worker_id, Arc::clone(&queue)));
+            workers.push(Worker::new(worker_id, Arc::clone(&receiver)));
         }
 
-        ThreadPool { size, threads, queue }
+        ThreadPool { size, workers, sender: Some(sender) }
     }
 
     pub fn execute<F>(&self, f: F) 
     where
         F: FnOnce() + Send + 'static,
     {
-        self.queue.lock().unwrap().push_back(Box::new(f));
+        self.sender.as_ref().unwrap().send(Box::new(f)).unwrap();
     }
 }
 
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+}
+
+struct Worker { 
+    id: usize,
+    thread: Option<JoinHandle<()>>,
+}
+
 impl Worker {
-    fn new(id: usize, queue: Arc<Mutex<VecDeque<Box<dyn FnOnce() + Send + 'static>>>>) -> Worker {
-        let thread = thread::spawn(move || {
-            while let Ok(mut queue) = queue.lock() {
-                if let Some(closure) = queue.pop_front() {
-                    drop(queue);
-                    closure();
-                }
+    fn new(id: usize, receiver: Arc<Mutex<Receiver<Job>>>) -> Worker {
+        let thread = thread::spawn(move || loop {
+            let job = receiver.lock().unwrap().recv();
+
+            if let Ok(job) = job {
+                println!("Worker {id} received job.");
+
+                job();
+            } else {
+                println!("No longer receiving messages! Worker {id} will shut down.");
+                break;
             }
         });
         
         Worker { 
             id, 
-            thread,
+            thread: Some(thread),
         }
     }
 } 
